@@ -56,6 +56,9 @@ CREATE TABLE IF NOT EXISTS assay_version (
     hole_id INTEGER NOT NULL REFERENCES hole(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('effective', 'superseded', 'failed')),
+    -- 化验单号：换交时填写，孔内唯一；改段/手动重算生成的版本沿用上一版单号。
+    -- 历史版本可能为空，只有带单号的版本允许签发。
+    assay_order_no TEXT,
     change_note TEXT NOT NULL DEFAULT '',
     added_count INTEGER NOT NULL DEFAULT 0,
     removed_count INTEGER NOT NULL DEFAULT 0,
@@ -101,12 +104,71 @@ CREATE TABLE IF NOT EXISTS segment_result (
 
 CREATE INDEX IF NOT EXISTS idx_assay_row_version ON assay_row(version_id);
 CREATE INDEX IF NOT EXISTS idx_segment_result_version ON segment_result(version_id);
+
+-- 底表 CSV 快照：同一版本只存一份；同一版签给多份报告共用该快照。
+CREATE TABLE IF NOT EXISTS supply_snapshot (
+    id INTEGER PRIMARY KEY,
+    version_id INTEGER NOT NULL UNIQUE REFERENCES assay_version(id) ON DELETE CASCADE,
+    hole_id INTEGER NOT NULL REFERENCES hole(id) ON DELETE CASCADE,
+    csv_content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 签发记录：每个孔每个报告号只签一次；带版本乐观校验，底表换版则拒签。
+CREATE TABLE IF NOT EXISTS issuance (
+    id INTEGER PRIMARY KEY,
+    hole_id INTEGER NOT NULL REFERENCES hole(id) ON DELETE CASCADE,
+    version_id INTEGER NOT NULL REFERENCES assay_version(id) ON DELETE CASCADE,
+    report_no TEXT NOT NULL,
+    snapshot_id INTEGER NOT NULL REFERENCES supply_snapshot(id) ON DELETE CASCADE,
+    recalled INTEGER NOT NULL DEFAULT 0 CHECK (recalled IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(hole_id, report_no)
+);
+
+-- 签发当时供数行实际引用的化验样号（仅 ok 供数段所选样号）。
+-- 召回查询走本表索引，无需逐份读取底表快照。
+CREATE TABLE IF NOT EXISTS issuance_sample_ref (
+    id INTEGER PRIMARY KEY,
+    issuance_id INTEGER NOT NULL REFERENCES issuance(id) ON DELETE CASCADE,
+    hole_id INTEGER NOT NULL REFERENCES hole(id) ON DELETE CASCADE,
+    assay_order_no TEXT NOT NULL,
+    sample_no TEXT NOT NULL,
+    segment_seq INTEGER NOT NULL,
+    start_cm INTEGER NOT NULL,
+    end_cm INTEGER NOT NULL
+);
+
+-- 化验作废登记：按化验单号 + 该单样号，孔内唯一。
+CREATE TABLE IF NOT EXISTS assay_void (
+    id INTEGER PRIMARY KEY,
+    hole_id INTEGER NOT NULL REFERENCES hole(id) ON DELETE CASCADE,
+    assay_order_no TEXT NOT NULL,
+    sample_no TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(hole_id, assay_order_no, sample_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_issuance_hole ON issuance(hole_id);
+CREATE INDEX IF NOT EXISTS idx_ref_lookup
+    ON issuance_sample_ref(hole_id, assay_order_no, sample_no);
+CREATE INDEX IF NOT EXISTS idx_ref_issuance ON issuance_sample_ref(issuance_id);
+CREATE INDEX IF NOT EXISTS idx_void_lookup ON assay_void(hole_id, assay_order_no, sample_no);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对既有数据库补齐后加列（新库 CREATE TABLE 已包含，跳过）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(assay_version)")}
+    if "assay_order_no" not in cols:
+        conn.execute("ALTER TABLE assay_version ADD COLUMN assay_order_no TEXT")
 
 
 def init_db() -> None:
     conn = get_db()
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
 
 

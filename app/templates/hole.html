@@ -8,9 +8,16 @@
     <form method="post" action="{{ url_for('upload', hole_id=hole.id) }}" enctype="multipart/form-data" style="flex:2;">
       <label class="muted">按样号换交化验 CSV（列为：样号、起厘米、止厘米、品位ppm、复验标记；一次上传即该孔当前全套化验）</label>
       <div class="row" style="margin-top:6px;">
-        <input type="file" name="assay_csv" accept=".csv,text/csv" required style="flex:2;">
-        <button type="submit" style="flex:0 0 auto;">上传并核算换交</button>
+        <div style="flex:1;">
+          <label class="muted">化验单号（孔内唯一；改段/重算自动沿用）</label>
+          <input type="text" name="assay_order_no" placeholder="例如 HX-2026-001" style="margin-top:4px;">
+        </div>
+        <div style="flex:2;">
+          <label class="muted">化验 CSV 文件</label>
+          <input type="file" name="assay_csv" accept=".csv,text/csv" required style="margin-top:4px;">
+        </div>
       </div>
+      <div style="margin-top:8px;"><button type="submit">上传并核算换交</button></div>
     </form>
     <form method="post" action="{{ url_for('do_recompute', hole_id=hole.id) }}" style="flex:1; align-self:flex-end;">
       <button type="submit" class="secondary">用当前化验重算</button>
@@ -21,7 +28,10 @@
   </div>
   <p class="muted" style="margin-bottom:0;">
     换交与重算在单事务内完成：化验、核查结果、底表快照一同生效；失败则整体回滚，仍可下载上次生效底表。
-    {% if version %}当前生效版本：#{{ version.seq }}（{{ version.created_at }}）{% else %}尚无生效版本。{% endif %}
+    {% if version %}当前生效版本：#{{ version.seq }}（{{ version.created_at }}）
+      {% if version.assay_order_no %}｜化验单号：<code>{{ version.assay_order_no }}</code>
+      {% else %}<span class="tag incomplete">无化验单号，不可签发</span>{% endif %}
+    {% else %}尚无生效版本。{% endif %}
   </p>
 </div>
 
@@ -110,12 +120,13 @@
 <div class="card">
   {% if versions %}
   <table>
-    <thead><tr><th>版本</th><th>状态</th><th>新增/消失/变更样号</th><th>说明</th><th>生成时间</th></tr></thead>
+    <thead><tr><th>版本</th><th>状态</th><th>化验单号</th><th>新增/消失/变更样号</th><th>说明</th><th>生成时间</th></tr></thead>
     <tbody>
       {% for v in versions %}
       <tr>
         <td>#{{ v.seq }}{% if v.id == hole.effective_version_id %} ★{% endif %}</td>
         <td>{{ v.status }}</td>
+        <td>{% if v.assay_order_no %}<code>{{ v.assay_order_no }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
         <td>{{ v.added_count }} / {{ v.removed_count }} / {{ v.changed_count }}</td>
         <td>{{ v.change_note }}</td>
         <td>{{ v.created_at }}</td>
@@ -126,5 +137,90 @@
   {% else %}
   <p class="muted">暂无版本。</p>
   {% endif %}
+</div>
+
+<h2>⑤ 底表签发（为页面所见的生效底表填写报告号；只签带化验单号的版本）</h2>
+<div class="card">
+  {% if version %}
+  <form method="post" action="{{ url_for('issue', hole_id=hole.id) }}">
+    <input type="hidden" name="expected_version_id" value="{{ version.id }}">
+    <div class="row">
+      <div style="flex:2;">
+        <label class="muted">报告号（每孔每个报告号只签一次）</label>
+        <input type="text" name="report_no" required placeholder="例如 BG-2026-088" style="margin-top:4px;">
+      </div>
+      <div style="flex:1; align-self:flex-end;">
+        <button type="submit" {% if not version.assay_order_no %}disabled title="当前版本没有化验单号"{% endif %}>
+          按当前生效版本 #{{ version.seq }} 签发
+        </button>
+      </div>
+    </div>
+  </form>
+  <p class="muted" style="margin-bottom:0;">
+    提交时若底表已换版会拒绝并提示刷新；签发归档当时的底表 CSV 快照（同一版多份报告共用一份快照），
+    并登记各供数段实际引用的化验样号，供作废召回时直接索引。
+  </p>
+  {% else %}
+  <p class="muted">尚无生效底表，暂不能签发。</p>
+  {% endif %}
+  {% if issuances %}
+  <table style="margin-top:14px;">
+    <thead><tr><th>报告号</th><th>签发版本</th><th>化验单号</th><th>状态</th><th>签发时间</th><th>归档快照</th></tr></thead>
+    <tbody>
+      {% for i in issuances %}
+      <tr>
+        <td><code>{{ i.report_no }}</code></td>
+        <td>#{{ i.version_seq }}</td>
+        <td><code>{{ i.assay_order_no }}</code></td>
+        <td>{% if i.recalled %}<span class="tag incomplete">已召回</span>{% else %}<span class="tag ok">有效</span>{% endif %}</td>
+        <td>{{ i.created_at }}</td>
+        <td><a class="btn secondary" href="{{ url_for('recall_snapshot', hole_id=hole.id, report_no=i.report_no) }}">下载签发当时 CSV</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<h2>⑥ 化验作废登记与报告召回查询</h2>
+<div class="row">
+  <div class="card" style="flex:1;">
+    <form method="post" action="{{ url_for('void_assay', hole_id=hole.id) }}">
+      <label class="muted">按化验单号 + 该单样号登记作废</label>
+      <div class="row" style="margin-top:6px;">
+        <div><input type="text" name="assay_order_no" required placeholder="化验单号"></div>
+        <div><input type="text" name="sample_no" required placeholder="样号"></div>
+      </div>
+      <input type="text" name="note" placeholder="作废说明（可选）" style="margin-top:8px;">
+      <div style="margin-top:8px;"><button type="submit">登记作废并召回受影响报告</button></div>
+    </form>
+    <p class="muted" style="margin-bottom:0;">
+      仍引用该化验的待签底表会被拒签；已签发且供数行实际引用该化验的报告自动列入召回，
+      作废与召回同一事务保存，失败则整体不生效。
+    </p>
+    {% if voids %}
+    <table style="margin-top:14px;">
+      <thead><tr><th>化验单号</th><th>样号</th><th>说明</th><th>登记时间</th></tr></thead>
+      <tbody>
+        {% for vd in voids %}
+        <tr><td><code>{{ vd.assay_order_no }}</code></td><td><code>{{ vd.sample_no }}</code></td><td>{{ vd.note or '—' }}</td><td>{{ vd.created_at }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+  <div class="card" style="flex:1;">
+    <form method="get" action="{{ url_for('recall_status', hole_id=hole.id) }}">
+      <label class="muted">按报告号查询召回状态（无需逐份读底表）</label>
+      <div class="row" style="margin-top:6px;">
+        <div style="flex:2;"><input type="text" name="report_no" required placeholder="报告号"></div>
+        <div style="flex:1;"><button type="submit" class="secondary">查询</button></div>
+      </div>
+    </form>
+    <p class="muted" style="margin-bottom:0;">
+      查询结果列出召回状态、命中作废的化验及对应深度段，并可下载该报告签发当时的底表 CSV 快照；
+      改段换版后历史快照仍可查档。
+    </p>
+  </div>
 </div>
 {% endblock %}

@@ -9,11 +9,14 @@ from flask import (
     Flask, abort, flash, redirect, render_template, request, send_file, url_for,
 )
 
-from .csvio import CsvError, assay_template_csv, export_supply_csv, parse_assay_csv
+from .csvio import CsvError, assay_template_csv, parse_assay_csv
 from .db import get_db, init_app
 from .services import ServiceError, create_hole, list_holes, list_segments
 from .services import list_results, list_versions, latest_assays, latest_version
 from .services import recompute, replace_segments, upload_assays
+from .services import (
+    issue_supply, list_issuances, list_voids, recall_query, register_void,
+)
 from .tiling import loads_samples
 
 
@@ -67,6 +70,8 @@ def create_app(config: dict | None = None) -> Flask:
         results = list_results(version["id"]) if version else []
         assays = latest_assays(hole_id)
         versions = list_versions(hole_id)
+        issuances = list_issuances(hole_id)
+        voids = list_voids(hole_id)
         # 把样号 JSON 解析成列表供模板展示。
         enriched = []
         for r in results:
@@ -82,6 +87,8 @@ def create_app(config: dict | None = None) -> Flask:
             results=enriched,
             assays=assays,
             versions=versions,
+            issuances=issuances,
+            voids=voids,
         )
 
     # ------------------------------------------------------------ 统计段
@@ -120,7 +127,8 @@ def create_app(config: dict | None = None) -> Flask:
             # 上传文件属于外部数据：只读字节、utf-8 解码，不执行其中任何内容。
             text = f.read().decode("utf-8-sig")
             assays = parse_assay_csv(text)
-            counts = upload_assays(hole_id, assays)
+            order_no = request.form.get("assay_order_no", "")
+            counts = upload_assays(hole_id, assays, assay_order_no=order_no)
             flash(
                 "换交成功（新版本 #{version_id}）：新增 {added} 个样号、消失 {removed} 个、"
                 "变更 {changed} 个；核查结果 供数 {ok} 段 / 分歧 {diverged} 段 / "
@@ -151,33 +159,98 @@ def create_app(config: dict | None = None) -> Flask:
         if hole["effective_version_id"] is None:
             flash("尚无生效底表：请先定义统计段并上传化验 CSV", "err")
             return redirect(url_for("hole_detail", hole_id=hole_id))
-        rows = list_results(hole["effective_version_id"])
-
-        class _V:  # 轻量适配 export_supply_csv 所需字段
-            def __init__(self, r):
-                self.seq = r["seq"]
-                self.start_cm = r["start_cm"]
-                self.end_cm = r["end_cm"]
-                self.status = r["status"]
-                self.grade_num = r["grade_num"]
-                self.grade_den = r["grade_den"]
-                self.grade_num_min = r["grade_num_min"]
-                self.grade_num_max = r["grade_num_max"]
-                self.recheck_cover_cm = r["recheck_cover_cm"]
-                self.samples_min = loads_samples(r["sample_path_min"])
-                self.samples_max = loads_samples(r["sample_path_max"])
-
-            @property
-            def length(self):
-                return self.end_cm - self.start_cm
-
-        data = export_supply_csv(hole["code"], [_V(r) for r in rows])
+        # 与签发快照共用同一导出逻辑，保证「所见即所存」。
+        from .services import build_version_supply_csv
+        data = build_version_supply_csv(conn, hole["effective_version_id"])
         buf = io.BytesIO(data.encode("utf-8-sig"))
         return send_file(
             buf,
             mimetype="text/csv; charset=utf-8",
             as_attachment=True,
             download_name=f"{hole['code']}_supply.csv",
+        )
+
+    # ------------------------------------------------------------ 底表签发
+    @app.route("/holes/<int:hole_id>/issue", methods=["POST"])
+    def issue(hole_id: int):
+        report_no = request.form.get("report_no", "")
+        raw_expected = request.form.get("expected_version_id") or ""
+        try:
+            expected = int(raw_expected) if raw_expected.strip() else None
+        except ValueError:
+            flash("签发失败：版本号参数无效，请刷新页面后重试", "err")
+            return redirect(url_for("hole_detail", hole_id=hole_id))
+        try:
+            info = issue_supply(hole_id, report_no, expected_version_id=expected)
+            flash(
+                f"报告号 {info['report_no']} 已签发（生效版本 #{info['version_id']}），"
+                "底表 CSV 快照已归档",
+                "ok",
+            )
+        except ServiceError as exc:
+            # 事务已回滚：本次签发不生效，旧签发记录不受影响。
+            flash(f"签发失败：{exc}", "err")
+        return redirect(url_for("hole_detail", hole_id=hole_id))
+
+    # ------------------------------------------------------------ 化验作废与召回
+    @app.route("/holes/<int:hole_id>/void", methods=["POST"])
+    def void_assay(hole_id: int):
+        order_no = request.form.get("assay_order_no", "")
+        sample_no = request.form.get("sample_no", "")
+        note = request.form.get("note", "")
+        try:
+            info = register_void(hole_id, order_no, sample_no, note)
+            if info["recalled_reports"]:
+                details = "；".join(
+                    f"{rno}（深度段 "
+                    + "、".join(
+                        f"[{s['start_cm']},{s['end_cm']})" for s in segs
+                    )
+                    + "）"
+                    for rno, segs in info["report_segments"].items()
+                )
+                flash(f"作废已登记，并召回报告：{details}", "ok")
+            else:
+                flash("作废已登记；当前没有签发报告引用该化验，无需召回", "ok")
+        except ServiceError as exc:
+            flash(f"作废失败：{exc}", "err")
+        return redirect(url_for("hole_detail", hole_id=hole_id))
+
+    @app.route("/holes/<int:hole_id>/recall")
+    def recall_status(hole_id: int):
+        report_no = request.args.get("report_no", "")
+        try:
+            info = recall_query(hole_id, report_no)
+        except ServiceError as exc:
+            flash(str(exc), "err")
+            return redirect(url_for("hole_detail", hole_id=hole_id))
+        if info is None:
+            flash(f"未找到报告号 {report_no} 的签发记录", "err")
+            return redirect(url_for("hole_detail", hole_id=hole_id))
+        return render_template(
+            "recall.html",
+            hole=get_db().execute(
+                "SELECT * FROM hole WHERE id = ?", (hole_id,)
+            ).fetchone(),
+            info=info,
+        )
+
+    @app.route("/holes/<int:hole_id>/recall/<path:report_no>/snapshot.csv")
+    def recall_snapshot(hole_id: int, report_no: str):
+        try:
+            info = recall_query(hole_id, report_no)
+        except ServiceError:
+            abort(404)
+        if info is None:
+            abort(404)
+        hole = get_db().execute("SELECT * FROM hole WHERE id = ?", (hole_id,)).fetchone()
+        buf = io.BytesIO(info["csv_content"].encode("utf-8-sig"))
+        safe_name = f"{hole['code']}_{report_no}_snapshot.csv"
+        return send_file(
+            buf,
+            mimetype="text/csv; charset=utf-8",
+            as_attachment=True,
+            download_name=safe_name,
         )
 
     @app.route("/template.csv")
